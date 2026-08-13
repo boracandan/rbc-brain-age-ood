@@ -6,7 +6,7 @@ from tqdm import tqdm
 from torch.utils.data import Dataset, DataLoader
 import torch
 import torch.nn as nn
-import MyModels
+import model
 from sklearn import metrics
 import json
 import csv
@@ -17,7 +17,7 @@ from pre_processing_util import pre_process_fMRI, pre_process_sMRI
 try:
     torch.amp.GradScaler
     _GradScaler = lambda: torch.amp.GradScaler('cuda')
-    _autocast   = lambda: _autocast()
+    _autocast   = lambda: torch.amp.autocast('cuda')
 except AttributeError:
     _GradScaler = torch.cuda.amp.GradScaler
     _autocast   = torch.cuda.amp.autocast
@@ -48,7 +48,7 @@ parser.add_argument("--modality",        type=str, default=None)
 parser.add_argument("--patience",   type=int, default=None)
 args = parser.parse_args()
 
-dir_path = os.environ.get("CCIR_DIR", r"C:\Users\Faruk\Code\CCIR_Project")
+dir_path = os.environ.get("RBC_DIR", r"C:\Users\Faruk\Code\rbc-brain-age-ood")
 
 # Trial Settings
 
@@ -260,7 +260,7 @@ def normalize_ages(age_lookup, *ids):
         test_ages  = (age_lookup.loc[test_ids].values  - mean) / std
 
     elif config["age_norm"] == "minmax_0_1":
-        max_age = 100 if "NKItrimmed" not in config["train_datasets"].split("_") else 22
+        max_age = 22
 
         train_ages = age_lookup.loc[train_ids].values / max_age
         val_ages   = age_lookup.loc[val_ids].values   / max_age
@@ -405,7 +405,7 @@ best_train_loss = float("inf")
 #   fMRI-only   → features are FC-profile rows (length = ROInum)
 #   fMRI&sMRI   → features are per-ROI sMRI morphometry values (length = NUM_SMRI_FEATS)
 feat_dim = NUM_SMRI_FEATS if config["modality"] == "fMRI&sMRI" else config["roi_scale"]
-model = MyModels.fMRINet(
+model = model.fMRINet(
     ROInum=config["roi_scale"],
     feat_dim=feat_dim,
     activation=config["age_output"],

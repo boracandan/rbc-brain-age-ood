@@ -16,7 +16,7 @@ import argparse
 from tqdm import tqdm
 from torch.utils.data import Dataset, DataLoader
 import torch
-import MyModels
+import model
 import matplotlib.pyplot as plt
 import json
 import csv
@@ -29,9 +29,11 @@ print(torch.cuda.get_device_name())
 parser = argparse.ArgumentParser(description="MAHGCN Age Regression — Test-set evaluation")
 parser.add_argument("trial_id", type=str, help="Trial directory under the experiment folder to evaluate")
 parser.add_argument("--experiment", type=str, default="MAHGCNExperiments")
+parser.add_argument("--cache_dir", type=str, default=None,
+                    help="Cache directory override (default: {dir_path}/cache_gen/cache)")
 args = parser.parse_args()
 
-dir_path = os.environ.get("CCIR_DIR", r"C:\Users\Faruk\Code\CCIR_Project")
+dir_path = os.environ.get("RBC_DIR", r"C:\Users\Faruk\Code\rbc-brain-age-ood")
 trial_dir = rf"{dir_path}/{args.experiment}/{args.trial_id}"
 
 # === Load config from disk (must match training) ===
@@ -201,7 +203,7 @@ def normalize_ages(age_lookup, *ids):
         test_ages  = (age_lookup.loc[test_ids].values  - mean) / std
 
     elif config["age_norm"] == "minmax_0_1":
-        max_age = 100 if "NKItrimmed" not in config["train_datasets"].split("_") else 22
+        max_age = 22 # 100 if "NKItrimmed" not in config["train_datasets"].split("_") else 22
 
         train_ages = age_lookup.loc[train_ids].values / max_age
         val_ages   = age_lookup.loc[val_ids].values   / max_age
@@ -274,7 +276,7 @@ age_lookup, train_ids, validation_ids, test_ids = get_meta_data(config["train_da
 train_ages, val_ages, test_ages = normalize_ages(age_lookup, train_ids, validation_ids, test_ids)
 
 # === Cache loading (test only — no build) ===
-_cache_dir  = rf"{dir_path}/{args.experiment}/cache"
+_cache_dir  = args.cache_dir if args.cache_dir else rf"{dir_path}/cache_gen/cache"
 _cache_key  = "_".join([config["fc_processing"], config["train_datasets"], config["test_datasets"],
                         config["modality"], str(config["roi_scale"])])
 _cache_subs = rf"{_cache_dir}/{_cache_key}_subjects.json"
@@ -295,7 +297,7 @@ test_loader  = DataLoader(test_dataset, batch_size=config["batch_size"], pin_mem
 
 # === Model: reconstruct from config, load checkpoint ===
 feat_dim = len(SMRI_FEATURES) if config["modality"] == "fMRI&sMRI" else config["roi_scale"]
-model = MyModels.fMRINet(
+model = model.fMRINet(
     ROInum=config["roi_scale"],
     feat_dim=feat_dim,
     activation=config["age_output"],
@@ -333,7 +335,7 @@ with open(rf"{trial_dir}/best_test_subjects.json", "w") as f:
 
 # Invert normalization so all metrics + plot are in years (matches old Testing.py convention)
 if config["age_norm"] == "minmax_0_1":
-    max_age = 100 if "NKItrimmed" not in config["train_datasets"].split("_") else 22
+    max_age = 22 # 100 if "NKItrimmed" not in config["train_datasets"].split("_") else 22
     true_yrs  = test_true * max_age
     preds_yrs = test_preds * max_age
 elif config["age_norm"] == "standardize":

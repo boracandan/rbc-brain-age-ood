@@ -3,6 +3,7 @@ trial_*/
 cache/
 *_experiment/
 MAHGCNExperiments/*/
+BaselineExperiments/
 .claude/
 .vscode/
 BHRC_*/
@@ -15,3 +16,7 @@ Runs/
 **/test_results.csv
 Literature/
 .html
+__pycache__/
+*.pyc
+*.pyo
+download_checkpoints.py
