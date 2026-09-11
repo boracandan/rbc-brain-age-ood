@@ -33,7 +33,7 @@ parser.add_argument("--cache_dir", type=str, default=None,
                     help="Cache directory override (default: {dir_path}/cache_gen/cache)")
 args = parser.parse_args()
 
-dir_path = os.environ.get("RBC_DIR", r"C:\Users\Faruk\Code\rbc-brain-age-ood")
+dir_path = os.environ.get("RBC_DIR", os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 trial_dir = rf"{dir_path}/{args.experiment}/{args.trial_id}"
 
 # === Load config from disk (must match training) ===

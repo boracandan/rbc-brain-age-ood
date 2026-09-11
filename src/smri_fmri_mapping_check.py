@@ -13,7 +13,7 @@ import os
 import pandas as pd
 from nilearn import datasets
 
-dir_path = r"C:\Users\Faruk\Code\rbc-brain-age-ood"
+dir_path = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SCALES = [200, 300, 400, 1000]
 
 STUDIES = {

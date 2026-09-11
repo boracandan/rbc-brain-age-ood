@@ -13,7 +13,7 @@ parser.add_argument("--degree_norm", action=argparse.BooleanOptionalAction, defa
                     help="GCN only: degree normalization (default: on). GAT always ignores this.")
 args = parser.parse_args()
 
-dir_path = os.environ.get("RBC_DIR", r"C:\Users\Faruk\Code\rbc-brain-age-ood")
+dir_path = os.environ.get("RBC_DIR", os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 trials = []
 

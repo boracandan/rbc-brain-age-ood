@@ -1,9 +1,10 @@
+import os
 import torch
 import torch.nn as nn
 import numpy as np
 import torch.nn.functional as F
 
-dir_path = r"C:\Users\Faruk\Code\rbc-brain-age-ood\src"
+dir_path = os.path.dirname(os.path.abspath(__file__))
 
 class GATEdgeLayer(nn.Module):
     """Multi-head GAT with FC edge-weight term in attention.

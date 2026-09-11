@@ -7,7 +7,7 @@ import os
 import glob
 from collections import defaultdict
 
-dir_path = r"C:\Users\Faruk\Code\rbc-brain-age-ood"
+dir_path = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 # Get all rest-task TSV files only
 rest_files = glob.glob(

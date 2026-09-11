@@ -48,7 +48,7 @@ parser.add_argument("--modality",        type=str, default=None)
 parser.add_argument("--patience",   type=int, default=None)
 args = parser.parse_args()
 
-dir_path = os.environ.get("RBC_DIR", r"C:\Users\Faruk\Code\rbc-brain-age-ood")
+dir_path = os.environ.get("RBC_DIR", os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 # Trial Settings
 

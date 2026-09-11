@@ -7,7 +7,7 @@ import os
 import glob
 from collections import defaultdict
 
-dir_path = r"C:\Users\Faruk\Code\rbc-brain-age-ood"
+dir_path = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 rest_files = glob.glob(
     rf"{dir_path}\NKI_CPAC\cpac_RBCv0\sub-*\ses-BAS1\func\*_task-rest_*_correlations.tsv"

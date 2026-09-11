@@ -1,6 +1,6 @@
 # Rethinking Graph Neural Networks for Out-of-distribution Generalization
 
-**Authors:** Bora Candan 
+**Authors:** [Author names]
 **Paper:** [Link to paper / arXiv]
 
 ## Abstract
