@@ -1,4 +1,4 @@
-# Rethinking Graph Neural Networks for Out-of-distribution Generalization
+# Rethinking Graph Neural Networks for Out-of-distribution Brain Age Regression
 
 **Authors:** [Author names]
 **Paper:** [Link to paper / arXiv]
@@ -122,7 +122,7 @@ If you use this code, please cite:
 
 ```bibtex
 @article{[citekey],
-  title   = {Rethinking Graph Neural Networks for Out-of-distribution Generalization},
+  title   = {Rethinking Graph Neural Networks for Out-of-distribution Brain Age Regression},
   author  = {[Authors]},
   journal = {[Journal / Conference]},
   year    = {[Year]},
