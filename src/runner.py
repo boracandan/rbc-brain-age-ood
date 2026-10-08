@@ -7,15 +7,30 @@ import argparse
 parser = argparse.ArgumentParser()
 parser.add_argument("--test_set", type=str, default=None, choices=["NKI", "CCNP", "HBN", "BHRC", "PNC"],
                     help="LOO test set to run. Omit to run all trials in the hardcoded list.")
-parser.add_argument("--trial", type=str, nargs="+", default=None, choices=["gcn_fmri", "gcn_multi", "gat_fmri", "gat_multi"],
-                    help="Trial type(s) to run. Omit to run all four. E.g. --trial gcn_fmri gcn_multi")
+parser.add_argument("--trial", type=str, nargs="+", default=None,
+                    choices=["gcn_fmri", "gcn_multi", "gat_fmri", "gat_multi", "gcn_concat", "gat_concat"],
+                    help="Trial type(s) to run. Omit to run the four original types; the concat types must be "
+                         "requested explicitly. E.g. --trial gcn_fmri gcn_concat")
 parser.add_argument("--degree_norm", action=argparse.BooleanOptionalAction, default=True,
                     help="GCN only: degree normalization (default: on). GAT always ignores this.")
+parser.add_argument("--dry_run", action="store_true",
+                    help="Print an audit of what would run (counts, grids, existing trials, cache check, first command) and exit.")
+parser.add_argument("--smoke", type=int, default=None, metavar="N",
+                    help="Keep only N evenly spaced trials per trial type, run them for --smoke_epochs epochs and write "
+                         "them to a separate '_smoke_<experiment>' folder (the real results are untouched).")
+parser.add_argument("--smoke_epochs", type=int, default=2, help="Epochs per trial in --smoke mode (default: 2).")
+parser.add_argument("--train_script", type=str, default=None,
+                    help="Training script to use instead of the default Training_multimodality.py.")
 args = parser.parse_args()
 
 dir_path = os.environ.get("RBC_DIR", os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 trials = []
+
+# Suffix of the trial_id for each modality (run_testing.py parses it to group trials)
+MODALITY_TAG = {"fMRI": "fmri", "fMRI&sMRI": "multi", "fMRI_concat_sMRI": "concat"}
+# Which cache a modality reads (concat reuses the fMRI&sMRI cache; see Modality.cache_name in the training script)
+CACHE_MODALITY = {"fMRI": "fMRI", "fMRI&sMRI": "fMRI&sMRI", "fMRI_concat_sMRI": "fMRI&sMRI"}
 
 
 def generate_trials(
@@ -50,7 +65,7 @@ def generate_trials(
                             identifier = f"{trial_id}.{hidden_dim}.{layer_num}.{l+1}.{m+1}" if gcn_mode == "gcn" else f"{trial_id}.{hidden_dim}.{layer_num}.{head_num}.{l+1}.{m+1}"
                             pro_entries.append(
                                 {
-                                    "trial_id": f"{identifier}.{pro_str}_{gcn_mode}_{'multi' if modality == 'fMRI&sMRI' else 'fmri'}",
+                                    "trial_id": f"{identifier}.{pro_str}_{gcn_mode}_{MODALITY_TAG[modality]}",
                                     "_script": _script,
                                     "fc_processing": processing,
                                     "age_norm": age_norm,
@@ -106,6 +121,92 @@ if args.test_set is not None:
         trials += generate_trials(f"trial_4{_deg_suffix}", _loo_fcs, [8, 16, 64], [1, 2, 3], [1e-5, 1e-4, 1e-3], [1e-4, 1e-3, 1e-2],
             gcn_mode="gat", num_heads=[1, 2, 4], modality="fMRI&sMRI", degree_normalize=False,
             train_datasets=train_ds, test_datasets=test_ds, experiment=exp)
+    if run_all or "gcn_concat" in args.trial:
+        trials += generate_trials(f"trial_5{_deg_suffix}", _loo_fcs, [32, 64, 128], [1, 2, 3], [1e-5, 1e-4, 1e-3], [1e-4, 1e-3, 1e-2],
+            gcn_mode="gcn", modality="fMRI_concat_sMRI", degree_normalize=args.degree_norm,
+            train_datasets=train_ds, test_datasets=test_ds, experiment=exp)
+    if run_all or "gat_concat" in args.trial:
+        trials += generate_trials(f"trial_6{_deg_suffix}", _loo_fcs, [32, 64, 128], [1, 2, 3], [1e-5, 1e-4, 1e-3], [1e-4, 1e-3, 1e-2],
+            gcn_mode="gat", num_heads=[1, 2, 4], modality="fMRI_concat_sMRI", degree_normalize=False,
+            train_datasets=train_ds, test_datasets=test_ds, experiment=exp)
+
+if args.train_script:
+    for t in trials:
+        t["_script"] = args.train_script
+
+
+def _preview_cmd(t):
+    """Display-only copy of the command the loop below builds (the loop itself is unchanged)."""
+    t = dict(t)
+    script = t.pop("_script", "Training_multimodality.py")
+    cmd = ["python", "-u", script, "--use_args"]
+    for k, v in t.items():
+        if isinstance(v, bool):
+            cmd.append(f"--{k}" if v else f"--no-{k}")
+        else:
+            cmd += [f"--{k}", str(v)]
+    return " ".join(f'"{c}"' if any(ch in c for ch in "&| ") else c for c in cmd)
+
+
+def _trial_type(t):
+    return t["trial_id"].split(".")[0]
+
+
+def audit(trials):
+    print(f"\n=== Dry run: --test_set {args.test_set} (train={train_ds}, test={test_ds}) ===")
+    ids = [t["trial_id"] for t in trials]
+    if len(ids) != len(set(ids)):
+        print(f"!! {len(ids) - len(set(ids))} duplicate trial_ids in this list")
+    by_type = defaultdict(list)
+    for t in trials:
+        by_type[_trial_type(t)].append(t)
+    for prefix, group in by_type.items():
+        exists = sum(os.path.isdir(f"{dir_path}/{t['experiment']}/{t['trial_id']}") for t in group)
+        g0 = group[0]
+        print(f"\n{prefix}: {len(group)} trials  ({exists} already exist and are skipped, {len(group) - exists} to run)")
+        print(f"  gcn_mode={g0['gcn_mode']}  modality={g0['modality']}  degree_normalize={g0['degree_normalize']}  "
+              f"roi_scale={g0['roi_scale']}  epochs={g0.get('epochs', 'script default')}  folder={g0['experiment']}")
+        for key in ["fc_processing", "hidden_dim", "num_gnn_layers", "num_heads", "weight_decay", "lr"]:
+            print(f"  {key}: {sorted({t[key] for t in group})}")
+    print("\nCache check (without a cache the training script preloads from disk, which is much slower):")
+    seen = set()
+    for t in trials:
+        cm = CACHE_MODALITY[t["modality"]]
+        key = "_".join([t["fc_processing"], t["train_datasets"], t["test_datasets"], cm, str(t["roi_scale"])])
+        if key in seen:
+            continue
+        seen.add(key)
+        exp_cache = f"{dir_path}/{t['experiment']}/cache"
+        cdir = exp_cache if os.path.exists(f"{exp_cache}/{key}_subjects.json") else f"{dir_path}/cache_gen/cache"
+        need = ["_subjects.json", "_fMRI.npy"] + ([] if cm == "fMRI" else ["_sMRI.npy"])
+        missing = [s for s in need if not os.path.exists(f"{cdir}/{key}{s}")]
+        status = "OK" if not missing else f"MISSING {missing}" + ("  (this trial builds it: save_fc_cache)" if t.get("save_fc_cache") else "")
+        print(f"  {status:<8} {key}")
+    if trials:
+        print(f"\nFirst command (run from {os.path.join(dir_path, 'src')}):\n  {_preview_cmd(trials[0])}")
+    print(f"\nTotal in this list: {len(trials)} trials. Nothing was run.")
+
+
+if (args.dry_run or args.smoke) and args.test_set is None:
+    parser.error("--dry_run and --smoke need --test_set")
+
+if args.smoke:
+    # N evenly spaced trials per trial type, a few epochs, in a fresh folder so real results are untouched
+    # (the timestamp keeps repeated smoke runs, e.g. an A/B timing, from being skipped as "already done")
+    _smoke_exp = f"_smoke_{exp}_{time.strftime('%H%M%S')}"
+    by_type = defaultdict(list)
+    for t in trials:
+        by_type[_trial_type(t)].append(t)
+    picked = []
+    for group in by_type.values():
+        for j in range(min(args.smoke, len(group))):
+            picked.append(dict(group[j * len(group) // args.smoke], experiment=_smoke_exp, epochs=args.smoke_epochs))
+    trials = picked
+    print(f"Smoke mode: {len(trials)} trials, {args.smoke_epochs} epochs each, folder {_smoke_exp}")
+
+if args.dry_run:
+    audit(trials)
+    raise SystemExit(0)
 
 times = defaultdict(list)
 

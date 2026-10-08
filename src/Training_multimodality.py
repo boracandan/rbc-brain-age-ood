@@ -1,3 +1,8 @@
+# Speed notes:
+#   1. the FC / sMRI cache is moved to the GPU once, so batches are built on the GPU
+#      (no pinned host copies, no loader workers);
+#   2. the train-set predictions of the best checkpoint are computed once after training,
+#      not at every validation improvement (rows follow train_ids).
 import pandas as pd
 import numpy as np
 import glob
@@ -11,6 +16,7 @@ from sklearn import metrics
 import json
 import csv
 import os
+from enum import Enum
 
 from pre_processing_util import pre_process_fMRI, pre_process_sMRI
 
@@ -70,7 +76,7 @@ config = {
     "degree_normalize": True,                   # the GCN fix
     "train_datasets":  "NKI", # dataset1_dataset2_...
     "test_datasets": "NKI", # dataset1_dataset2_...
-    "modality": "fMRI", # "fMRI" | "fMRI&sMRI"
+    "modality": "fMRI", # "fMRI" | "fMRI&sMRI" | "fMRI_concat_sMRI"
     "patience": 20,
 }
 
@@ -116,6 +122,43 @@ _SMRI_FEATURE_SETS = {
 }
 SMRI_FEATURES = _SMRI_FEATURE_SETS["extended"]
 NUM_SMRI_FEATS = len(SMRI_FEATURES)
+
+# Utility Functions
+
+class Modality(Enum):
+    FMRI             = "fMRI"
+    FMRI_SMRI        = "fMRI&sMRI"
+    FMRI_CONCAT_SMRI = "fMRI_concat_sMRI"
+
+    @property
+    def requires_smri(self):
+        return self is not Modality.FMRI
+
+    def feat_dim(self, roi_scale):
+        if self is Modality.FMRI:
+            return roi_scale
+        if self is Modality.FMRI_SMRI:
+            return NUM_SMRI_FEATS
+        return roi_scale + NUM_SMRI_FEATS  # FMRI_CONCAT_SMRI
+
+    @property
+    def cache_name(self):
+        """Caches hold the FC and the z-scored sMRI arrays separately, so concat reuses the fMRI&sMRI cache."""
+        return Modality.FMRI_SMRI.value if self.requires_smri else self.value
+
+    def model_inputs(self, tensors):
+        """Arguments for model(g_matrix, node_features) from the loaded (fc,) / (fc, smri) tensors.
+
+        Concat appends the already z-scored sMRI columns to the raw FC rows; the FC part stays
+        unnormalized, exactly as in fMRI-only mode where node features = g_matrix.
+        """
+        if self is Modality.FMRI_CONCAT_SMRI:
+            fc, smri = tensors
+            return (fc, torch.cat([fc, smri.to(fc.dtype)], dim=-1))  # (n, n + NUM_SMRI_FEATS)
+        return tuple(tensors)
+
+
+modality = Modality(config["modality"])
 
 
 def _resolve_paths(study, sub, n):
@@ -186,17 +229,17 @@ def _load_data(study, sub, n, modality):
     path_fMRI, path_sMRI = _resolve_paths(study, sub, n)
 
     # In multimodal mode we need both; in fMRI-only we only need the FC.
-    if path_fMRI is None or (modality == "fMRI&sMRI" and path_sMRI is None):
-        raise FileNotFoundError(f"Missing files for {study}/{sub} at scale {n} (modality={modality})")
+    if path_fMRI is None or (modality.requires_smri and path_sMRI is None):
+        raise FileNotFoundError(f"Missing files for {study}/{sub} at scale {n} (modality={modality.value})")
 
     # --- fMRI: FC matrix + processing ---
     mat = pd.read_csv(path_fMRI, sep="\t", header=None).values.astype(np.float32)
     if mat.shape != (n, n):
         raise ValueError(f"FC for {study}/{sub} at scale {n} has wrong shape {mat.shape} -- corrupt or stub file? path={path_fMRI}")
-    
+
     mat = pre_process_fMRI(mat, config)
-    
-    if modality != "fMRI&sMRI":
+
+    if not modality.requires_smri:
         return (torch.tensor(mat),)
 
     # --- sMRI: regional surface stats for the matching atlas, FC-column order ---
@@ -205,7 +248,7 @@ def _load_data(study, sub, n, modality):
 
     if feat_mat.shape != (n, NUM_SMRI_FEATS):
         raise ValueError(f"sMRI features for {study}/{sub} at scale {n} have wrong shape {feat_mat.shape}, expected ({n}, {NUM_SMRI_FEATS}) -- corrupt TSV? path={path_sMRI}")
-    
+
     return (torch.tensor(mat), torch.tensor(feat_mat))
 
 
@@ -226,7 +269,7 @@ class RBCDataset(Dataset):
             print(f"Preloading {len(study_subject_ids)} subjects into RAM...")
             self.indices = None
             raw = [_load_data(*sub.split("_", 1), config["roi_scale"], modality) for sub in tqdm(study_subject_ids)]
-            if modality == "fMRI&sMRI":
+            if modality.requires_smri:
                 fMRI_tensors = [d[0] for d in raw]
                 smri_arr = np.stack([d[1].numpy() for d in raw])  # (N, 300, 4)
                 if self.smri_mean is None:
@@ -242,11 +285,12 @@ class RBCDataset(Dataset):
 
     def __getitem__(self, idx):
         if self.data is not None:
-            return (*self.data[idx],), self.ages[idx]
-        i = self.indices[idx]
-        return (
-            *(_fc_cache[modality][i] for modality in self.modality.split("&")),
-        ), self.ages[idx]
+            tensors = self.data[idx]
+        else:
+            i = self.indices[idx]
+            cache_keys = ["fMRI", "sMRI"] if self.modality.requires_smri else ["fMRI"]
+            tensors = tuple(_fc_cache[key][i] for key in cache_keys)
+        return self.modality.model_inputs(tensors), self.ages[idx]
 
 
 def normalize_ages(age_lookup, *ids):
@@ -334,10 +378,10 @@ train_ages, val_ages, test_ages = normalize_ages(age_lookup, train_ids, validati
 # Cache: one .npy per modality + a subjects index JSON. Cache key includes roi_scale.
 # Always load from cache if present; build+save only when --save_fc_cache is passed.
 _cache_key  = "_".join([config["fc_processing"], config["train_datasets"], config["test_datasets"],
-                        config["modality"], str(config["roi_scale"])])
+                        modality.cache_name, str(config["roi_scale"])])
 _cache_dir  = rf"{dir_path}/{args.experiment}/cache" if os.path.exists(rf"{dir_path}/{args.experiment}/cache/{_cache_key}_subjects.json") else rf"{dir_path}/cache_gen/cache"
 _cache_subs = rf"{_cache_dir}/{_cache_key}_subjects.json"
-_modalities = ["fMRI", "sMRI"] if config["modality"] == "fMRI&sMRI" else ["fMRI"]
+_modalities = ["fMRI", "sMRI"] if modality.requires_smri else ["fMRI"]
 _cache_npy  = {m: rf"{_cache_dir}/{_cache_key}_{m}.npy" for m in _modalities}
 
 if all(os.path.exists(p) for p in [_cache_subs] + list(_cache_npy.values())):
@@ -352,13 +396,13 @@ elif args.save_fc_cache:
     all_subs = list(train_ids) + list(validation_ids) + list(test_ids)
     fc_list, smri_list = [], []
     for sub in tqdm(all_subs):
-        # _load_data returns (fc,) for fMRI-only or (fc, feat) for fMRI&sMRI
-        data = _load_data(*sub.split("_", 1), config["roi_scale"], config["modality"])
+        # _load_data returns (fc,) for fMRI-only, or (fc, feat) for fMRI&sMRI / fMRI_concat_sMRI
+        data = _load_data(*sub.split("_", 1), config["roi_scale"], modality)
         fc_list.append(data[0].numpy())
-        if config["modality"] == "fMRI&sMRI":
+        if modality.requires_smri:
             smri_list.append(data[1].numpy())
     _fc_cache = {"fMRI": np.stack(fc_list)}
-    if config["modality"] == "fMRI&sMRI":
+    if modality.requires_smri:
         n_train = len(train_ids) + len(validation_ids)
         temp_smri_list = np.stack(smri_list)
         mean = temp_smri_list[:n_train].mean(axis=0)
@@ -372,17 +416,26 @@ elif args.save_fc_cache:
     _fc_cache = {m: torch.from_numpy(_fc_cache[m]) for m in _modalities}
     print(f"Cache saved to {_cache_dir}")
 
-train_dataset = RBCDataset(train_ids, train_ages, config["modality"])
-val_dataset   = RBCDataset(validation_ids, val_ages,  config["modality"],
+_gpu_batches = _fc_cache is not None
+if _gpu_batches:
+    _fc_cache = {m: t.cuda() for m, t in _fc_cache.items()}
+    print(f"Cache moved to GPU ({sum(t.numel() * t.element_size() for t in _fc_cache.values()) / 1e9:.2f} GB).")
+else:
+    print("No cache loaded; data stays on the CPU (this variant then behaves like the original).")
+
+train_dataset = RBCDataset(train_ids, train_ages, modality)
+val_dataset   = RBCDataset(validation_ids, val_ages,  modality,
                             smri_mean=train_dataset.smri_mean, smri_std=train_dataset.smri_std)
-test_dataset  = RBCDataset(test_ids,  test_ages,  config["modality"],
+test_dataset  = RBCDataset(test_ids,  test_ages,  modality,
                             smri_mean=train_dataset.smri_mean, smri_std=train_dataset.smri_std)
 
 import platform
-_nw = 0 if platform.system() == "Windows" else 2
-train_loader = DataLoader(train_dataset, batch_size=config["batch_size"], shuffle=True, drop_last=True, pin_memory=True, num_workers=_nw, persistent_workers=_nw > 0)
-test_loader  = DataLoader(test_dataset,  batch_size=config["batch_size"], pin_memory=True, num_workers=_nw, persistent_workers=_nw > 0)
-val_loader   = DataLoader(val_dataset,   batch_size=config["batch_size"], pin_memory=True, num_workers=_nw, persistent_workers=_nw > 0)
+# With the cache on the GPU, batches are stacked there: no pinning (not allowed for CUDA tensors) and no workers.
+_nw = 0 if (platform.system() == "Windows" or _gpu_batches) else 2
+_pin = not _gpu_batches
+train_loader = DataLoader(train_dataset, batch_size=config["batch_size"], shuffle=True, drop_last=True, pin_memory=_pin, num_workers=_nw, persistent_workers=_nw > 0)
+test_loader  = DataLoader(test_dataset,  batch_size=config["batch_size"], pin_memory=_pin, num_workers=_nw, persistent_workers=_nw > 0)
+val_loader   = DataLoader(val_dataset,   batch_size=config["batch_size"], pin_memory=_pin, num_workers=_nw, persistent_workers=_nw > 0)
 
 # Training
 
@@ -401,10 +454,8 @@ lr = config["lr"]
 best_val_loss = float("inf")
 best_train_loss = float("inf")
 
-# Node-feature dimension depends on modality:
-#   fMRI-only   → features are FC-profile rows (length = ROInum)
-#   fMRI&sMRI   → features are per-ROI sMRI morphometry values (length = NUM_SMRI_FEATS)
-feat_dim = NUM_SMRI_FEATS if config["modality"] == "fMRI&sMRI" else config["roi_scale"]
+# Node-feature dimension depends on modality — see Modality.feat_dim
+feat_dim = modality.feat_dim(config["roi_scale"])
 model = model.fMRINet(
     ROInum=config["roi_scale"],
     feat_dim=feat_dim,
@@ -481,24 +532,31 @@ for epoch in range(config["epochs"]):
         # For Plotting
         np.save(rf"{trial_dir}/best_val_preds.npy", np.array(val_preds))
         np.save(rf"{trial_dir}/best_val_true.npy",  np.array(val_true))
-        train_preds_full = []
-        train_true_full  = []
-        with torch.no_grad():
-            for inputs, y in train_loader:
-                inputs = [t.cuda(non_blocking=True) for t in inputs]
-                with _autocast():
-                    out = model(*inputs)
-                train_preds_full.extend(out.squeeze(-1).cpu().tolist())
-                train_true_full.extend(y.tolist())
-        np.save(rf"{trial_dir}/best_train_preds.npy", np.array(train_preds_full))
-        np.save(rf"{trial_dir}/best_train_true.npy",  np.array(train_true_full))
-
 
     else:
         counter += 1
         if counter >= config["patience"]:
             stop_early = True
             break
+
+# Train-set predictions of the best checkpoint, computed once. Unshuffled and without drop_last,
+# so row i belongs to train_ids[i].
+_best_ckpt = rf"{trial_dir}/ckpt/best_model.pth"
+if os.path.exists(_best_ckpt):
+    model.load_state_dict(torch.load(_best_ckpt, map_location="cuda"))
+    model.eval()
+    _train_eval_loader = DataLoader(train_dataset, batch_size=config["batch_size"], shuffle=False, pin_memory=_pin, num_workers=_nw, persistent_workers=_nw > 0)
+    train_preds_full = []
+    train_true_full  = []
+    with torch.no_grad():
+        for inputs, y in _train_eval_loader:
+            inputs = [t.cuda(non_blocking=True) for t in inputs]
+            with _autocast():
+                out = model(*inputs)
+            train_preds_full.extend(out.squeeze(-1).cpu().tolist())
+            train_true_full.extend(y.tolist())
+    np.save(rf"{trial_dir}/best_train_preds.npy", np.array(train_preds_full))
+    np.save(rf"{trial_dir}/best_train_true.npy",  np.array(train_true_full))
 
 # Logging
 

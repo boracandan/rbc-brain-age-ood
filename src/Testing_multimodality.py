@@ -21,6 +21,7 @@ import matplotlib.pyplot as plt
 import json
 import csv
 import os
+from enum import Enum
 
 from pre_processing_util import pre_process_fMRI, pre_process_sMRI
 
@@ -69,6 +70,43 @@ _SMRI_FEATURE_SETS = {
 }
 SMRI_FEATURES = _SMRI_FEATURE_SETS["extended"]
 NUM_SMRI_FEATS = len(SMRI_FEATURES)
+
+
+# Keep in sync with Modality in Training_multimodality.py
+class Modality(Enum):
+    FMRI             = "fMRI"
+    FMRI_SMRI        = "fMRI&sMRI"
+    FMRI_CONCAT_SMRI = "fMRI_concat_sMRI"
+
+    @property
+    def requires_smri(self):
+        return self is not Modality.FMRI
+
+    def feat_dim(self, roi_scale):
+        if self is Modality.FMRI:
+            return roi_scale
+        if self is Modality.FMRI_SMRI:
+            return NUM_SMRI_FEATS
+        return roi_scale + NUM_SMRI_FEATS  # FMRI_CONCAT_SMRI
+
+    @property
+    def cache_name(self):
+        """Caches hold the FC and the z-scored sMRI arrays separately, so concat reuses the fMRI&sMRI cache."""
+        return Modality.FMRI_SMRI.value if self.requires_smri else self.value
+
+    def model_inputs(self, tensors):
+        """Arguments for model(g_matrix, node_features) from the loaded (fc,) / (fc, smri) tensors.
+
+        Concat appends the already z-scored sMRI columns to the raw FC rows; the FC part stays
+        unnormalized, exactly as in fMRI-only mode where node features = g_matrix.
+        """
+        if self is Modality.FMRI_CONCAT_SMRI:
+            fc, smri = tensors
+            return (fc, torch.cat([fc, smri.to(fc.dtype)], dim=-1))  # (n, n + NUM_SMRI_FEATS)
+        return tuple(tensors)
+
+
+modality = Modality(config["modality"])
 
 
 def _resolve_paths(study, sub, n):
@@ -139,8 +177,8 @@ def _load_data(study, sub, n, modality):
     path_fMRI, path_sMRI = _resolve_paths(study, sub, n)
 
     # In multimodal mode we need both; in fMRI-only we only need the FC.
-    if path_fMRI is None or (modality == "fMRI&sMRI" and path_sMRI is None):
-        raise FileNotFoundError(f"Missing files for {study}/{sub} at scale {n} (modality={modality})")
+    if path_fMRI is None or (modality.requires_smri and path_sMRI is None):
+        raise FileNotFoundError(f"Missing files for {study}/{sub} at scale {n} (modality={modality.value})")
 
     # --- fMRI: FC matrix + processing ---
     mat = pd.read_csv(path_fMRI, sep="\t", header=None).values.astype(np.float32)
@@ -149,16 +187,16 @@ def _load_data(study, sub, n, modality):
     
     mat = pre_process_fMRI(mat, config)
     
-    if modality != "fMRI&sMRI":
+    if not modality.requires_smri:
         return (torch.tensor(mat),)
 
     # --- sMRI: regional surface stats for the matching atlas, FC-column order ---
     reg_surfs = pd.read_csv(path_sMRI, sep="\t")
     feat_mat = pre_process_sMRI(reg_surfs, SMRI_FEATURES, SMRI_ATLAS_NAMES, resolution=n, config=config)
 
-    if feat_mat.shape != (n, len(SMRI_FEATURES)):
-        raise ValueError(f"sMRI features for {study}/{sub} at scale {n} have wrong shape {feat_mat.shape}, expected ({n}, {len(SMRI_FEATURES)}) -- corrupt TSV? path={path_sMRI}")
-    
+    if feat_mat.shape != (n, NUM_SMRI_FEATS):
+        raise ValueError(f"sMRI features for {study}/{sub} at scale {n} have wrong shape {feat_mat.shape}, expected ({n}, {NUM_SMRI_FEATS}) -- corrupt TSV? path={path_sMRI}")
+
     return (torch.tensor(mat), torch.tensor(feat_mat))
 
 
@@ -185,11 +223,12 @@ class RBCDataset(Dataset):
 
     def __getitem__(self, idx):
         if self.data is not None:
-            return (*self.data[idx],), self.ages[idx]
-        i = self.indices[idx]
-        return (
-            *(torch.from_numpy(_fc_cache[modality][i]) for modality in self.modality.split("&")),
-        ), self.ages[idx]
+            tensors = self.data[idx]
+        else:
+            i = self.indices[idx]
+            cache_keys = ["fMRI", "sMRI"] if self.modality.requires_smri else ["fMRI"]
+            tensors = tuple(torch.from_numpy(_fc_cache[key][i]) for key in cache_keys)
+        return self.modality.model_inputs(tensors), self.ages[idx]
 
 
 def normalize_ages(age_lookup, *ids):
@@ -278,9 +317,9 @@ train_ages, val_ages, test_ages = normalize_ages(age_lookup, train_ids, validati
 # === Cache loading (test only — no build) ===
 _cache_dir  = args.cache_dir if args.cache_dir else rf"{dir_path}/cache_gen/cache"
 _cache_key  = "_".join([config["fc_processing"], config["train_datasets"], config["test_datasets"],
-                        config["modality"], str(config["roi_scale"])])
+                        modality.cache_name, str(config["roi_scale"])])
 _cache_subs = rf"{_cache_dir}/{_cache_key}_subjects.json"
-_modalities = ["fMRI", "sMRI"] if config["modality"] == "fMRI&sMRI" else ["fMRI"]
+_modalities = ["fMRI", "sMRI"] if modality.requires_smri else ["fMRI"]
 _cache_npy  = {m: rf"{_cache_dir}/{_cache_key}_{m}.npy" for m in _modalities}
 
 if all(os.path.exists(p) for p in [_cache_subs] + list(_cache_npy.values())):
@@ -290,13 +329,17 @@ if all(os.path.exists(p) for p in [_cache_subs] + list(_cache_npy.values())):
     _fc_cache       = {m: np.load(_cache_npy[m]) for m in _modalities}
     print("Cache loaded.")
 else:
+    # Training z-scores the sMRI branch with train statistics; this script only loads the
+    # test subjects, so without the cache it would feed un-normalized sMRI to the model.
+    if modality.requires_smri:
+        raise FileNotFoundError(f"Cache '{_cache_key}' not found in {_cache_dir}; required for modality={modality.value} so sMRI is normalized as in training.")
     print("Cache not found — will preload test subjects into RAM.")
 
-test_dataset = RBCDataset(test_ids, test_ages, config["modality"])
+test_dataset = RBCDataset(test_ids, test_ages, modality)
 test_loader  = DataLoader(test_dataset, batch_size=config["batch_size"], pin_memory=True)
 
 # === Model: reconstruct from config, load checkpoint ===
-feat_dim = len(SMRI_FEATURES) if config["modality"] == "fMRI&sMRI" else config["roi_scale"]
+feat_dim = modality.feat_dim(config["roi_scale"])
 model = model.fMRINet(
     ROInum=config["roi_scale"],
     feat_dim=feat_dim,
