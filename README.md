@@ -32,7 +32,8 @@ rbc-brain-age-ood/
 │   ├── test_r_heatmap.pdf                # Test-set Pearson r heatmap (LOO splits × architectures)
 │   └── delta_r_heatmap.pdf               # Δr heatmap (val r − test r generalization gap)
 │
-├── analysis_of_results.ipynb             # Main results analysis and figure generation
+├── analysis_of_results_MSE.ipynb         # Results analysis and figures, GNN trials selected by validation MSE
+├── analysis_of_results_R.ipynb           # Same analysis, GNN trials selected by validation Pearson r
 ├── baseline_OOD_training.ipynb           # Baseline model (Ridge/XGBoost) training and evaluation
 ├── study_splitting.ipynb                 # Subject-level train/val/test split construction
 ├── saved_variables.json                  # Serialized LOO subject splits (used by download script)
@@ -114,7 +115,7 @@ Reads saved `.npy` predictions and writes `best_val_r` / `best_val_mae` back int
 
 **6. Analyse results**
 
-Open `analysis_of_results.ipynb` for result tables and figure generation (test-r heatmap, Δr heatmap). Baseline model training and evaluation is in `baseline_OOD_training.ipynb`.
+Open `analysis_of_results_MSE.ipynb` (selection by validation MSE) or `analysis_of_results_R.ipynb` (selection by validation r) for result tables and figure generation (test-r heatmap, Δr heatmap). Baseline model training and evaluation is in `baseline_OOD_training.ipynb`.
 
 ## Citation
 

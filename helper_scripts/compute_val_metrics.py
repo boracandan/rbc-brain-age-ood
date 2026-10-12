@@ -1,8 +1,9 @@
 """
-Computes best_val_r and best_val_mae for each trial from saved .npy predictions
-and writes them back into each LOO split's results_table.csv.
+Fills best_val_r and best_val_mae (validation Pearson r and MAE in years of the best-loss checkpoint) in each
+LOO split's results_table.csv, from the saved best_val_preds.npy / best_val_true.npy of every trial.
+Only rows with a missing value are filled; existing values are never overwritten.
 
-Run from the project root:
+Run it once all training runs have finished (it rewrites the results tables):
     python helper_scripts/compute_val_metrics.py
 """
 
@@ -22,43 +23,47 @@ LOO_SPLITS = [
     "LOO_NKI",
     "LOO_PNC",
 ]
+MAX_AGE = 22  # ages were divided by this for age_norm == "minmax_0_1"
 
-for experiment in LOO_SPLITS:
-    exp_results_path = os.path.join(dir_path, experiment, "results_table.csv")
-    if not os.path.exists(exp_results_path):
-        print(f"Skipping {experiment} — no results_table.csv found")
-        continue
 
-    df = pd.read_csv(exp_results_path)
+def val_metrics(experiment, trial_id):
+    """(val r, val MAE in years) of a trial, or None if its saved files are not available."""
+    trial_dir = os.path.join(dir_path, experiment, trial_id)
+    files = [os.path.join(trial_dir, f) for f in ("best_val_preds.npy", "best_val_true.npy", "config.json")]
+    if not all(os.path.exists(f) for f in files):
+        return None
+    preds, true = np.load(files[0]), np.load(files[1])
+    with open(files[2], encoding="utf-8-sig") as f:
+        cfg = json.load(f)
+    if cfg.get("age_norm") == "minmax_0_1":
+        preds, true = preds * MAX_AGE, true * MAX_AGE
+    return round(float(pearsonr(true, preds)[0]), 3), round(float(np.mean(np.abs(preds - true))), 3)
 
-    if all(x in df.columns for x in ["best_val_r", "best_val_mae"]):
-        print(f"{experiment}: best_val_r/mae already present — skipping")
-        continue
 
-    rs, maes = [], []
-    for trial_id in df["trial_id"]:
-        trial_dir  = os.path.join(dir_path, experiment, trial_id)
-        preds_file = os.path.join(trial_dir, "best_val_preds.npy")
-        true_file  = os.path.join(trial_dir, "best_val_true.npy")
-        cfg_file   = os.path.join(trial_dir, "config.json")
+def main():
+    for experiment in LOO_SPLITS:
+        path = os.path.join(dir_path, experiment, "results_table.csv")
+        if not os.path.exists(path):
+            print(f"Skipping {experiment} — no results_table.csv found")
+            continue
+        df = pd.read_csv(path)
+        for col in ("best_val_r", "best_val_mae"):
+            if col not in df.columns:
+                df[col] = np.nan
 
-        if os.path.exists(preds_file) and os.path.exists(true_file) and os.path.exists(cfg_file):
-            preds = np.load(preds_file)
-            true  = np.load(true_file)
-            with open(cfg_file, encoding="utf-8-sig") as f:
-                cfg = json.load(f)
-            if cfg.get("age_norm") == "minmax_0_1":
-                max_age = 22
-                preds, true = preds * max_age, true * max_age
-            rs.append(round(float(pearsonr(true, preds)[0]), 3))
-            maes.append(round(float(np.mean(np.abs(preds - true))), 3))
-        else:
-            rs.append(None)
-            maes.append(None)
+        missing = df["best_val_r"].isna() | df["best_val_mae"].isna()
+        if not missing.any():
+            print(f"{experiment}: no missing best_val_r/mae — nothing to do")
+            continue
+        filled = 0
+        for i in df.index[missing]:
+            m = val_metrics(experiment, df.at[i, "trial_id"])
+            if m is not None:
+                df.at[i, "best_val_r"], df.at[i, "best_val_mae"] = m
+                filled += 1
+        df.to_csv(path, index=False)
+        print(f"{experiment}: filled {filled} of {int(missing.sum())} missing rows -> {path}")
 
-    df["best_val_r"]   = rs
-    df["best_val_mae"] = maes
-    df.to_csv(exp_results_path, index=False)
 
-    n_ok = sum(r is not None for r in rs)
-    print(f"{experiment}: wrote best_val_r/mae for {n_ok}/{len(df)} trials -> {exp_results_path}")
+if __name__ == "__main__":
+    main()

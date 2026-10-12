@@ -1,6 +1,7 @@
 """
 Runs Testing_multimodality.py for the top-5 trials per architecture group
-per LOO split, ranked by best_state_val_loss.
+per LOO split, ranked by the metric set in METRIC below. Trials already in a
+split's test_results.csv are skipped.
 
 Usage:
     python run_testing.py
@@ -19,6 +20,15 @@ TESTING_PY = os.path.join(_SRC, "Testing_multimodality.py")
 PYTHON     = sys.executable
 TOP_K      = 5
 
+# How trials are ranked within each architecture group:
+#   "val_loss" -> lowest best_state_val_loss (validation MSE)
+#   "val_r"    -> highest best_val_r (validation Pearson r)
+METRIC = "val_r"
+METRIC_COLUMNS = {                      # metric -> (results_table column, lowest value is best)
+    "val_loss": ("best_state_val_loss", True),
+    "val_r":    ("best_val_r",          False),
+}
+
 LOO_SPLITS = {
     "LOO_BHRC": "BHRC",
     "LOO_CCNP": "CCNP",
@@ -34,16 +44,19 @@ GROUPS = [
     "GCN_fMRI&sMRI_nodeg",
     "GAT_fMRI",
     "GAT_fMRI&sMRI",
+    "GCN_fMRI_concat_sMRI",
+    "GCN_fMRI_concat_sMRI_nodeg",
+    "GAT_fMRI_concat_sMRI",
 ]
 # ─────────────────────────────────────────────────────────────────────────────
 
 
 def arch_group(row):
-    m = re.search(r'_(gcn|gat)_(fmri|multi)$', row["trial_id"])
+    m = re.search(r'_(gcn|gat)_(fmri|multi|concat)$', row["trial_id"])
     if m is None:
         return "unknown"
     arch = m.group(1).upper()
-    mod  = "fMRI&sMRI" if m.group(2) == "multi" else "fMRI"
+    mod  = {"fmri": "fMRI", "multi": "fMRI&sMRI", "concat": "fMRI_concat_sMRI"}[m.group(2)]
     deg  = str(row["degree_norm"]).strip().lower() in ("true", "1")
     return f"{arch}_{mod}" + ("" if deg or arch == "GAT" else "_nodeg")
 
@@ -56,12 +69,14 @@ def already_tested(split, trial_id):
     return trial_id in df["trial_id"].values
 
 
-def get_top_trials(split):
+def get_top_trials(split, metric):
+    column, lowest_is_best = METRIC_COLUMNS[metric]
     df = pd.read_csv(os.path.join(DIR, split, "results_table.csv"))
     df["arch_group"] = df.apply(arch_group, axis=1)
     trials = []
     for group in GROUPS:
-        sub = df[df["arch_group"] == group].nsmallest(TOP_K, "best_state_val_loss")
+        sub = df[df["arch_group"] == group]
+        sub = sub.nsmallest(TOP_K, column) if lowest_is_best else sub.nlargest(TOP_K, column)
         for tid in sub["trial_id"]:
             trials.append((tid, group))
     return trials
@@ -75,7 +90,7 @@ for split in LOO_SPLITS:
     print(f"  {split}")
     print(f"{'='*65}")
 
-    trials = get_top_trials(split)
+    trials = get_top_trials(split, METRIC)
     total += len(trials)
 
     for tid, group in trials:

@@ -20,3 +20,6 @@ __pycache__/
 *.pyc
 *.pyo
 download_checkpoints.py
+BaselineExperiments_*/
+queue_logs/
+rebuttals.txt
